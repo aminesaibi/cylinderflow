@@ -15,17 +15,22 @@ from ufl import (FiniteElement, TestFunction, TrialFunction, VectorElement,
 
 class NS():
     def __init__(self,
-                 dt=1.0e-2):
-        self.gdim = 2
-        model_rank = 0
+                 dt=1.0e-2,
+                 mu=0.001,
+                 rho=1):
 
-        self.mesh, _, self.ft = gmshio.read_from_msh(
-            "./ns_cylinder/mesh.msh", MPI.COMM_WORLD, model_rank, gdim=self.gdim)
+        self.gdim = 2
+        self.mesh, _, self.ft = gmshio.read_from_msh("./ns_cylinder/mesh.msh",
+                                                     MPI.COMM_WORLD,
+                                                     rank=0,
+                                                     gdim=self.gdim
+                                                     )
         self.ft.name = "Facet markers"
-        self.dt = dt                # Time step size
-        self.k = Constant(self.mesh, PETSc.ScalarType(self.dt))
-        self.mu = Constant(self.mesh, PETSc.ScalarType(0.001))  # Dynamic viscosity
-        self.rho = Constant(self.mesh, PETSc.ScalarType(1))     # Density
+
+        # define our problem specific physical and descritization parameters
+        self.dt = Constant(self.mesh, PETSc.ScalarType(dt))
+        self.mu = Constant(self.mesh, PETSc.ScalarType(mu))  # Dynamic viscosity
+        self.rho = Constant(self.mesh, PETSc.ScalarType(rho))     # Density
 
         v_cg2 = VectorElement("CG", self.mesh.ufl_cell(), 2)
         s_cg1 = FiniteElement("CG", self.mesh.ufl_cell(), 1)
@@ -99,7 +104,7 @@ class NS():
 
         # we define the variational formulation for the first step, where we have integrated the diffusion term,
         # as well as the pressure term by parts.
-        F1 = self.rho / self.k * dot(u - self.u_n, v) * dx
+        F1 = self.rho / self.dt * dot(u - self.u_n, v) * dx
         F1 += inner(dot(1.5 * self.u_n - 0.5 * self.u_n1, 0.5 * nabla_grad(u + self.u_n)), v) * dx
         F1 += 0.5 * self.mu * inner(grad(u + self.u_n), grad(v))*dx - dot(self.p_, div(v))*dx
         F1 += dot(f, v) * dx
@@ -110,14 +115,14 @@ class NS():
 
         # Next we define the second step
         self.a2 = form(dot(grad(p), grad(q))*dx)
-        self.L2 = form(-self.rho / self.k * dot(div(self.u_s), q) * dx)
+        self.L2 = form(-self.rho / self.dt * dot(div(self.u_s), q) * dx)
         A2 = assemble_matrix(self.a2, bcs=self.bcp)
         A2.assemble()
         self.b2 = create_vector(self.L2)
 
         # finally create the last step
         a3 = form(self.rho * dot(u, v)*dx)
-        self.L3 = form(self.rho * dot(self.u_s, v)*dx - self.k * dot(nabla_grad(self.phi), v)*dx)
+        self.L3 = form(self.rho * dot(self.u_s, v)*dx - self.dt * dot(nabla_grad(self.phi), v)*dx)
         A3 = assemble_matrix(a3)
         A3.assemble()
         self.b3 = create_vector(self.L3)
@@ -150,19 +155,23 @@ class NS():
         self.file = XDMFFile(self.mesh.comm, "./ns_cylinder/u_p.xdmf", "w")
         self.file.write_mesh(self.mesh)
 
-        # self.file.write_function(self.u_, t)
-        # self.file.write_function(self.p_, t)
-
     def inlet_velocity(self, x):
         values = np.zeros((self.gdim, x.shape[1]), dtype=PETSc.ScalarType)
         values[0] = 4 * 1.5 * x[1] * (0.41 - x[1])/(0.41**2)
         return values
 
-
-    def advance(self):
+    def advance(self, dt=None, u_n=None, u_n1=None):
         # Update inlet velocity
         # inlet_velocity.t = t
         # u_inlet.interpolate(inlet_velocity)
+        if dt is not None:
+            self.dt = Constant(self.mesh, PETSc.ScalarType(dt))
+        if u_n is not None:
+            self.u_n = u_n
+        if u_n1 is not None:
+            self.u_n1 = u_n1
+
+        # solve  for one-step the time-dependent problem
 
         # Step 1: Tentative velocity step
         self.A1.zeroEntries()
@@ -200,24 +209,18 @@ class NS():
 
         return (self.u_, self.p_)
 
+    def run(self, t=0, T=5.0):
 
-    def run(self):
-
-        # define our problem specific physical and descritization parameters
-        t = 0
-        T = 5.0                     # Final time
-        num_steps = int(T/self.dt)
-
-        # solve the time-dependent problem
+        num_steps = int(T/self.dt.value)
 
         progress = tqdm.autonotebook.tqdm(desc="Solving PDE", total=num_steps)
         for i in range(num_steps):
             progress.update(1)
-            
-            # Update current time step
-            t += self.dt
 
-            self.u, self.p_ = self.advance()
+            # Update current time step
+            t += self.dt.value
+
+            self.u_, self.p_ = self.advance()
 
             # Write solutions to file
             self.file.write_function(self.u_, t)
@@ -233,7 +236,7 @@ class NS():
 
 def main():
     ns = NS()
-    ns.run()
+    ns.run(t=0, T=5.0)
 
 
 if __name__ == "__main__":
