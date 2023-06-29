@@ -107,7 +107,7 @@ class NS():
         F1 = self.rho / self.dt * dot(u - self.u_n, v) * dx
         F1 += inner(dot(1.5 * self.u_n - 0.5 * self.u_n1, 0.5 * nabla_grad(u + self.u_n)), v) * dx
         F1 += 0.5 * self.mu * inner(grad(u + self.u_n), grad(v))*dx - dot(self.p_, div(v))*dx
-        F1 += dot(f, v) * dx
+        F1 -= dot(f, v) * dx
         self.a1 = form(lhs(F1))
         self.L1 = form(rhs(F1))
         self.A1 = create_matrix(self.a1)
