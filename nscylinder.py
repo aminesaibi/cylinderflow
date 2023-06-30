@@ -2,13 +2,11 @@ import numpy as np
 import tqdm.autonotebook
 from mpi4py import MPI
 from petsc4py import PETSc
-
 from dolfinx.fem import (Constant, Function, FunctionSpace, dirichletbc, form,
                          locate_dofs_topological, set_bc)
 from dolfinx.fem.petsc import (apply_lifting, assemble_matrix, assemble_vector,
                                create_vector, create_matrix, set_bc)
 from dolfinx.io import (gmshio, XDMFFile)
-
 from ufl import (FiniteElement, TestFunction, TrialFunction, VectorElement,
                  div, dot, dx, inner, lhs, grad, nabla_grad, rhs)
 
@@ -42,18 +40,6 @@ class NS():
         # the boundary conditions. As the ft contains markers for facets,
         # we use this class to find the facets for the inlet and walls.
         fdim = self.mesh.topology.dim - 1
-
-        # Define boundary conditions
-
-        # # Define boundary conditions
-        # class InletVelocity():
-        #     def __init__(self, t):
-        #         self.t = t
-
-        #     def __call__(self, x):
-        #         values = np.zeros((self.gdim, x.shape[1]),dtype=PETSc.ScalarType)
-        #         values[0] = 4 * 1.5 * np.sin(self.t * np.pi/8) * x[1] * (0.41 - x[1])/(0.41**2)
-        #         return values
 
         inlet_marker, outlet_marker, wall_marker, obstacle_marker = 2, 3, 4, 5
 
@@ -92,7 +78,6 @@ class NS():
         self.u_.name = "u"
         self.u_s = Function(self.V)
         self.u_n = Function(self.V)
-        self.u_n1 = Function(self.V)
 
         # Pressure solutions
         self.p_ = Function(self.Q)
@@ -105,7 +90,7 @@ class NS():
         # we define the variational formulation for the first step, where we have integrated the diffusion term,
         # as well as the pressure term by parts.
         F1 = self.rho / self.dt * dot(u - self.u_n, v) * dx
-        F1 += inner(dot(1.5 * self.u_n - 0.5 * self.u_n1, 0.5 * nabla_grad(u + self.u_n)), v) * dx
+        F1 += inner(dot(self.u_n , 0.5 * nabla_grad(u + self.u_n)), v) * dx
         F1 += 0.5 * self.mu * inner(grad(u + self.u_n), grad(v))*dx - dot(self.p_, div(v))*dx
         F1 -= dot(f, v) * dx
         self.a1 = form(lhs(F1))
@@ -128,7 +113,6 @@ class NS():
         self.b3 = create_vector(self.L3)
 
         # we use PETSc as a linear algebra backend
-
         # Solver for step 1
         self.solver1 = PETSc.KSP().create(self.mesh.comm)
         self.solver1.setOperators(self.A1)
@@ -160,19 +144,13 @@ class NS():
         values[0] = 4 * 1.5 * x[1] * (0.41 - x[1])/(0.41**2)
         return values
 
-    def advance(self, dt=None, u_n=None, u_n1=None):
-        # Update inlet velocity
-        # inlet_velocity.t = t
-        # u_inlet.interpolate(inlet_velocity)
+    def advance(self, dt=None, u_n=None):
         if dt is not None:
             self.dt = Constant(self.mesh, PETSc.ScalarType(dt))
         if u_n is not None:
             self.u_n = u_n
-        if u_n1 is not None:
-            self.u_n1 = u_n1
 
         # solve  for one-step the time-dependent problem
-
         # Step 1: Tentative velocity step
         self.A1.zeroEntries()
         assemble_matrix(self.A1, self.a1, bcs=self.bcu)
@@ -227,8 +205,7 @@ class NS():
             self.file.write_function(self.p_, t)
 
             # Update variable with solution form this time step
-            with self.u_.vector.localForm() as uvec_, self.u_n.vector.localForm() as uvec_n, self.u_n1.vector.localForm() as uvec_n1:
-                uvec_n.copy(uvec_n1)
+            with self.u_.vector.localForm() as uvec_, self.u_n.vector.localForm() as uvec_n:
                 uvec_.copy(uvec_n)
 
         self.file.close()
