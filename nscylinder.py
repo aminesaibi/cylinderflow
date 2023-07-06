@@ -1,13 +1,14 @@
 import numpy as np
-import tqdm.autonotebook
+import math
+from tqdm import tqdm
 from mpi4py import MPI
 from petsc4py import PETSc
 from dolfinx.fem import (Constant, Function, FunctionSpace, dirichletbc, form,
-                         locate_dofs_topological, set_bc)
+                         assemble_scalar, locate_dofs_topological, set_bc)
 from dolfinx.fem.petsc import (apply_lifting, assemble_matrix, assemble_vector,
                                create_vector, create_matrix, set_bc)
 from dolfinx.io import (gmshio, XDMFFile)
-from ufl import (FiniteElement, TestFunction, TrialFunction, VectorElement,
+from ufl import (FiniteElement, TestFunction, TrialFunction, VectorElement, TensorElement,
                  div, dot, dx, inner, lhs, grad, nabla_grad, rhs)
 
 
@@ -15,7 +16,11 @@ class NS():
     def __init__(self,
                  dt=1.0e-2,
                  mu=0.001,
-                 rho=1):
+                 rho=1,
+                 xa=[0.3, 0.2],
+                 xs=[2.0, 0.2],
+                 var=0.4
+                 ):
 
         self.gdim = 2
         self.mesh, _, self.ft = gmshio.read_from_msh("./ns_cylinder/mesh.msh",
@@ -32,6 +37,8 @@ class NS():
 
         v_cg2 = VectorElement("CG", self.mesh.ufl_cell(), 2)
         s_cg1 = FiniteElement("CG", self.mesh.ufl_cell(), 1)
+        v_cg3 = TensorElement("CG", self.mesh.ufl_cell(), 2, shape=(3,2))
+        self.S = FunctionSpace(self.mesh, v_cg3)
         self.V = FunctionSpace(self.mesh, v_cg2)
         self.Q = FunctionSpace(self.mesh, s_cg1)
 
@@ -78,24 +85,41 @@ class NS():
         self.u_.name = "u"
         self.u_s = Function(self.V)
         self.u_n = Function(self.V)
+        self.u_n1 = Function(self.V)
 
         # Pressure solutions
+        # self.p_n = Function(self.Q)
         self.p_ = Function(self.Q)
         self.p_.name = "p"
         self.phi = Function(self.Q)
 
         # forcing term
-        f = Constant(self.mesh, PETSc.ScalarType((0, 0)))
+        # f = Constant(self.mesh, PETSc.ScalarType((0, 0)))
+        self.forcing = self.Forcing(self.gdim, var, xa)
+        self.f = Function(self.V)
+        self.f.interpolate(self.forcing)
+
+        self.sensors = self.Sensors(self.gdim, var, xs)
+        self.g = Function(self.S)
+        self.g.interpolate(self.sensors)
+
+        self.r = form(inner(self.u_, self.u_)*dx)
 
         # we define the variational formulation for the first step, where we have integrated the diffusion term,
         # as well as the pressure term by parts.
         F1 = self.rho / self.dt * dot(u - self.u_n, v) * dx
-        F1 += inner(dot(self.u_n , 0.5 * nabla_grad(u + self.u_n)), v) * dx
+        F1 += inner(dot(1.5 * self.u_n - 0.5 * self.u_n1, 0.5 * nabla_grad(u + self.u_n)), v) * dx
+        # F1 += inner(dot(self.u_n, 0.5 * nabla_grad(u + self.u_n)), v) * dx
+        # F1 += inner(self.rk4(nl, self.u_n, self.dt), v) * dx
         F1 += 0.5 * self.mu * inner(grad(u + self.u_n), grad(v))*dx - dot(self.p_, div(v))*dx
-        F1 -= dot(f, v) * dx
+        # F1 += 0.5 * self.mu * inner(grad(u + self.u_n), grad(v))*dx - dot(self.p_n, div(v))*dx
+        F1 -= dot(self.f, v) * dx
         self.a1 = form(lhs(F1))
         self.L1 = form(rhs(F1))
         self.A1 = create_matrix(self.a1)
+        # self.A1.zeroEntries()
+        # assemble_matrix(self.A1, self.a1, bcs=self.bcu)
+        # self.A1.assemble()
         self.b1 = create_vector(self.L1)
 
         # Next we define the second step
@@ -108,6 +132,7 @@ class NS():
         # finally create the last step
         a3 = form(self.rho * dot(u, v)*dx)
         self.L3 = form(self.rho * dot(self.u_s, v)*dx - self.dt * dot(nabla_grad(self.phi), v)*dx)
+        # self.L3 = form(self.rho * dot(self.u_s, v)*dx - self.dt * dot(nabla_grad(self.p_), v)*dx)
         A3 = assemble_matrix(a3)
         A3.assemble()
         self.b3 = create_vector(self.L3)
@@ -139,12 +164,61 @@ class NS():
         self.file = XDMFFile(self.mesh.comm, "./ns_cylinder/u_p.xdmf", "w")
         self.file.write_mesh(self.mesh)
 
+    @staticmethod
+    def rk4(f, x0, dt=0.1):
+        k1 = dt*f(x0)
+        k2 = dt*f(x0 + 0.5*k1)
+        k3 = dt*f(x0 + 0.5*k2)
+        k4 = dt*f(x0 + k3)
+        x1 = x0 + (k1+2*(k2+k3) + k4)/6
+        return x1
+
+    @staticmethod
+    def nl(u):
+        return dot(u, nabla_grad(u))
+
+    class Forcing:
+        def __init__(self, gdim, var, xa):
+            self.gdim = gdim
+            self.var = var
+            self.xa = np.array(xa)
+            self.na = self.xa.shape[0]
+            self.coef = (1/(np.sqrt(2*math.pi)*self.var))
+            self.u = 0.5*np.ones((1, self.na))
+            self.t = 0.0
+
+        def __call__(self, x):
+            values = np.zeros((self.gdim, x.shape[1]), dtype=PETSc.ScalarType)
+            values[0] = (self.u*self.coef * np.exp(-(np.tile(x[0].reshape(-1, 1),self.na) - self.xa[:, 0])**2/self.var)).sum(1)
+            values[1] = (self.u*self.coef * np.exp(-(np.tile(x[1].reshape(-1, 1),self.na) - self.xa[:, 1])**2/self.var)).sum(1)
+            return values
+
+    class Sensors:
+        def __init__(self, gdim, var, xs):
+            self.gdim = gdim
+            self.var = var
+            self.xs = np.array(xs)
+            self.ns = self.xs.shape[0]
+            self.coef = (1/(np.sqrt(2*math.pi)*self.var))
+            self.t = 0.0
+        # def __call__(self, x):
+        #     values = np.zeros((self.gdim, self.ns, x.shape[1]), dtype=PETSc.ScalarType)
+        #     values[0] = 0.5*self.coef * np.exp(-(np.tile(x[0].reshape(-1, 1), self.ns) - self.xs[:, 0])**2/self.var).T
+        #     values[1] = 0.5*self.coef * np.exp(-(np.tile(x[1].reshape(-1, 1), self.ns) - self.xs[:, 1])**2/self.var).T
+
+        def __call__(self, x):
+            values = np.zeros((self.gdim, self.ns, x.shape[1]), dtype=PETSc.ScalarType)
+            values[0] = self.coef * np.exp(-(np.tile(x[0].reshape(-1, 1), self.ns) - self.xs[:, 0])**2/self.var).T
+            values[1] = self.coef * np.exp(-(np.tile(x[1].reshape(-1, 1), self.ns) - self.xs[:, 1])**2/self.var).T
+            values = values.reshape((self.ns*self.gdim, -1), order='F')
+            return values
+
     def inlet_velocity(self, x):
         values = np.zeros((self.gdim, x.shape[1]), dtype=PETSc.ScalarType)
         values[0] = 4 * 1.5 * x[1] * (0.41 - x[1])/(0.41**2)
         return values
 
-    def advance(self, dt=None, u_n=None):
+    def advance(self, dt=None, u_n=None, f=None):
         if dt is not None:
             self.dt = Constant(self.mesh, PETSc.ScalarType(dt))
         if u_n is not None:
@@ -155,6 +229,7 @@ class NS():
         self.A1.zeroEntries()
         assemble_matrix(self.A1, self.a1, bcs=self.bcu)
         self.A1.assemble()
+        self.b1 = create_vector(self.L1)
         with self.b1.localForm() as loc:
             loc.set(0)
         assemble_vector(self.b1, self.L1)
@@ -172,7 +247,9 @@ class NS():
         self.b2.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)
         set_bc(self.b2, self.bcp)
         self.solver2.solve(self.b2, self.phi.vector)
+        # self.solver2.solve(self.b2, self.p_.vector)
         self.phi.x.scatter_forward()
+        # self.p_.x.scatter_forward()
 
         self.p_.vector.axpy(1, self.phi.vector)
         self.p_.x.scatter_forward()
@@ -184,35 +261,64 @@ class NS():
         self.b3.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)
         self.solver3.solve(self.b3, self.u_.vector)
         self.u_.x.scatter_forward()
+        
+        y = np.zeros(self.sensors.ns)
+        for i in range(self.sensors.ns):
+            y[i] = assemble_scalar(form(inner(self.g[i,:],self.u_)*dx))
+        energy = self.mesh.comm.gather(assemble_scalar(self.r), root=0)
 
-        return (self.u_, self.p_)
+        return self.u_, self.p_, energy, y
 
     def run(self, t=0, T=5.0):
 
         num_steps = int(T/self.dt.value)
+        energies = np.zeros(num_steps)
+        observations = np.zeros((num_steps, self.sensors.ns))
 
-        progress = tqdm.autonotebook.tqdm(desc="Solving PDE", total=num_steps)
+        progress = tqdm(desc="Solving PDE", total=num_steps)
         for i in range(num_steps):
             progress.update(1)
 
             # Update current time step
             t += self.dt.value
+            self.forcing.t = t
+            self.f.interpolate(self.forcing)
 
-            self.u_, self.p_ = self.advance()
+            self.u_, self.p_, energy, y = self.advance()
+            
+            if self.mesh.comm.rank == 0:
+                energies[i] = sum(energy)
+                observations[i] = y
 
             # Write solutions to file
-            self.file.write_function(self.u_, t)
             self.file.write_function(self.p_, t)
+            self.file.write_function(self.u_, t)
+
+            # # Update variable with solution form this time step
+            # with self.u_.vector.localForm() as u_, self.u_n.vector.localForm() as u_n:
+            #     u_.copy(u_n)
+            # with self.p_.vector.localForm() as p_, self.p_n.vector.localForm() as p_n:
+            #     p_.copy(p_n)
 
             # Update variable with solution form this time step
-            with self.u_.vector.localForm() as uvec_, self.u_n.vector.localForm() as uvec_n:
-                uvec_.copy(uvec_n)
+            with self.u_.vector.localForm() as loc_, self.u_n.vector.localForm() as loc_n, self.u_n1.vector.localForm() as loc_n1:
+                loc_n.copy(loc_n1)
+                loc_.copy(loc_n)
 
+        np.savetxt('./ns_cylinder/energies.txt', energies)
+        np.savetxt('./ns_cylinder/observations.txt', observations)
         self.file.close()
 
 
 def main():
-    ns = NS()
+    ns = NS(
+        dt=1.0e-2,
+        mu=0.001,
+        rho=1,
+        xa=[[0.25, 0.15], [0.25, 0.25], [0.9, 0.2]],
+        xs=[[2.0, 0.2], [1.5, 0.2], [0.9, 0.2]],
+        var=0.4
+    )
     ns.run(t=0, T=5.0)
 
 
