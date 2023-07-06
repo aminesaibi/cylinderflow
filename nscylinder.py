@@ -22,6 +22,9 @@ class NS():
                  var=0.4
                  ):
 
+        self.xs = np.array(xs)
+        self.ns = self.xs.shape[0]
+        self.var = var
         self.gdim = 2
         self.mesh, _, self.ft = gmshio.read_from_msh("./ns_cylinder/mesh.msh",
                                                      MPI.COMM_WORLD,
@@ -37,8 +40,6 @@ class NS():
 
         v_cg2 = VectorElement("CG", self.mesh.ufl_cell(), 2)
         s_cg1 = FiniteElement("CG", self.mesh.ufl_cell(), 1)
-        v_cg3 = TensorElement("CG", self.mesh.ufl_cell(), 2, shape=(3,2))
-        self.S = FunctionSpace(self.mesh, v_cg3)
         self.V = FunctionSpace(self.mesh, v_cg2)
         self.Q = FunctionSpace(self.mesh, s_cg1)
 
@@ -99,9 +100,7 @@ class NS():
         self.f = Function(self.V)
         self.f.interpolate(self.forcing)
 
-        self.sensors = self.Sensors(self.gdim, var, xs)
-        self.g = Function(self.S)
-        self.g.interpolate(self.sensors)
+        self.sensors = self.InstSensors()
 
         self.r = form(inner(self.u_, self.u_)*dx)
 
@@ -189,29 +188,40 @@ class NS():
 
         def __call__(self, x):
             values = np.zeros((self.gdim, x.shape[1]), dtype=PETSc.ScalarType)
-            values[0] = (self.u*self.coef * np.exp(-(np.tile(x[0].reshape(-1, 1),self.na) - self.xa[:, 0])**2/self.var)).sum(1)
-            values[1] = (self.u*self.coef * np.exp(-(np.tile(x[1].reshape(-1, 1),self.na) - self.xa[:, 1])**2/self.var)).sum(1)
+            values[0] = (self.u*self.coef * np.exp(-(np.tile(x[0].reshape(-1, 1),
+                         self.na) - self.xa[:, 0])**2/self.var)).sum(1)
+            values[1] = (self.u*self.coef * np.exp(-(np.tile(x[1].reshape(-1, 1),
+                         self.na) - self.xa[:, 1])**2/self.var)).sum(1)
             return values
 
+    def InstSensors(self):
+        return NS.Sensors(self)
+
     class Sensors:
-        def __init__(self, gdim, var, xs):
-            self.gdim = gdim
-            self.var = var
-            self.xs = np.array(xs)
+        def __init__(self, NS_obj):
+            self.xs = NS_obj.xs
             self.ns = self.xs.shape[0]
+            self.var = NS_obj.var
+            self.gdim = NS_obj.gdim
             self.coef = (1/(np.sqrt(2*math.pi)*self.var))
-            self.t = 0.0
-        # def __call__(self, x):
-        #     values = np.zeros((self.gdim, self.ns, x.shape[1]), dtype=PETSc.ScalarType)
-        #     values[0] = 0.5*self.coef * np.exp(-(np.tile(x[0].reshape(-1, 1), self.ns) - self.xs[:, 0])**2/self.var).T
-        #     values[1] = 0.5*self.coef * np.exp(-(np.tile(x[1].reshape(-1, 1), self.ns) - self.xs[:, 1])**2/self.var).T
+
+            v_cg3 = TensorElement("CG", NS_obj.mesh.ufl_cell(), 2, shape=(3, 2))
+            self.S = FunctionSpace(NS_obj.mesh, v_cg3)
+            self.h = Function(self.S)
+            self.h.interpolate(self.__call__)
+            self.forms = [form(inner(self.h[i, :], NS_obj.u_)*dx) for i in range(self.ns)]
 
         def __call__(self, x):
             values = np.zeros((self.gdim, self.ns, x.shape[1]), dtype=PETSc.ScalarType)
-            values[0] = self.coef * np.exp(-(np.tile(x[0].reshape(-1, 1), self.ns) - self.xs[:, 0])**2/self.var).T
-            values[1] = self.coef * np.exp(-(np.tile(x[1].reshape(-1, 1), self.ns) - self.xs[:, 1])**2/self.var).T
+            values[0] = self.coef * \
+                np.exp(-(np.tile(x[0].reshape(-1, 1), self.ns) - self.xs[:, 0])**2/self.var).T
+            values[1] = self.coef * \
+                np.exp(-(np.tile(x[1].reshape(-1, 1), self.ns) - self.xs[:, 1])**2/self.var).T
             values = values.reshape((self.ns*self.gdim, -1), order='F')
             return values
+
+        def get_values(self):
+            return np.array([assemble_scalar(form) for form in self.forms])
 
     def inlet_velocity(self, x):
         values = np.zeros((self.gdim, x.shape[1]), dtype=PETSc.ScalarType)
@@ -261,11 +271,9 @@ class NS():
         self.b3.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)
         self.solver3.solve(self.b3, self.u_.vector)
         self.u_.x.scatter_forward()
-        
-        y = np.zeros(self.sensors.ns)
-        for i in range(self.sensors.ns):
-            y[i] = assemble_scalar(form(inner(self.g[i,:],self.u_)*dx))
+
         energy = self.mesh.comm.gather(assemble_scalar(self.r), root=0)
+        y = self.sensors.get_values()
 
         return self.u_, self.p_, energy, y
 
@@ -285,7 +293,7 @@ class NS():
             self.f.interpolate(self.forcing)
 
             self.u_, self.p_, energy, y = self.advance()
-            
+
             if self.mesh.comm.rank == 0:
                 energies[i] = sum(energy)
                 observations[i] = y
@@ -312,14 +320,14 @@ class NS():
 
 def main():
     ns = NS(
-        dt=1.0e-2,
-        mu=0.001,
-        rho=1,
-        xa=[[0.25, 0.15], [0.25, 0.25], [0.9, 0.2]],
-        xs=[[2.0, 0.2], [1.5, 0.2], [0.9, 0.2]],
-        var=0.4
+        dt = 1.0e-2,
+        mu = 0.001,
+        rho = 1,
+        xa = [[0.25, 0.15], [0.25, 0.25], [0.9, 0.2]],
+        xs = [[2.0, 0.2], [1.5, 0.2], [0.9, 0.2]],
+        var = 0.4
     )
-    ns.run(t=0, T=5.0)
+    ns.run(t = 0, T = 5.0)
 
 
 if __name__ == "__main__":
