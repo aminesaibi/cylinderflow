@@ -1,0 +1,10 @@
+batch_size: 64
+memory_size: 2000
+n_episodes: 1800
+n_rollout: 2000
+params_update_rate: 1.0
+policy_lr: 5.0e-4
+policy_reg: 0.0
+train_steps_per_episode: 10
+value_lr: 1.0e-3
+value_reg: 0.0

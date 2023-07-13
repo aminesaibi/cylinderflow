@@ -24,9 +24,11 @@ class NS():
 
         self.xs = np.array(xs)
         self.ns = self.xs.shape[0]
+        self.xa = np.array(xa)
+        self.na = self.xa.shape[0]
         self.var = var
         self.gdim = 2
-        self.mesh, _, self.ft = gmshio.read_from_msh("./ns_cylinder/mesh.msh",
+        self.mesh, _, self.ft = gmshio.read_from_msh("./environment/mesh.msh",
                                                      MPI.COMM_WORLD,
                                                      rank=0,
                                                      gdim=self.gdim
@@ -96,9 +98,8 @@ class NS():
 
         # forcing term
         # f = Constant(self.mesh, PETSc.ScalarType((0, 0)))
-        self.forcing = self.Forcing(self.gdim, var, xa)
-        self.f = Function(self.V)
-        self.f.interpolate(self.forcing)
+        self.forcing = self.InstForcing()
+        self.f = self.forcing.get_function()
 
         self.sensors = self.InstSensors()
 
@@ -177,14 +178,20 @@ class NS():
         return dot(u, nabla_grad(u))
 
     class Forcing:
-        def __init__(self, gdim, var, xa):
-            self.gdim = gdim
-            self.var = var
-            self.xa = np.array(xa)
+        def __init__(self, NS_obj):
+            self.xa = NS_obj.xa
             self.na = self.xa.shape[0]
+            self.var = NS_obj.var
+            self.gdim = NS_obj.gdim
+            self.fun = Function(NS_obj.V)
             self.coef = (1/(np.sqrt(2*math.pi)*self.var))
-            self.u = 0.5*np.ones((1, self.na))
-            self.t = 0.0
+            self.u = np.zeros((1, self.na))
+
+        def get_function(self, u=None):
+            if u is not None:
+                self.u = u
+            self.fun.interpolate(self.__call__)
+            return self.fun
 
         def __call__(self, x):
             values = np.zeros((self.gdim, x.shape[1]), dtype=PETSc.ScalarType)
@@ -193,9 +200,6 @@ class NS():
             values[1] = (self.u*self.coef * np.exp(-(np.tile(x[1].reshape(-1, 1),
                          self.na) - self.xa[:, 1])**2/self.var)).sum(1)
             return values
-
-    def InstSensors(self):
-        return NS.Sensors(self)
 
     class Sensors:
         def __init__(self, NS_obj):
@@ -209,7 +213,10 @@ class NS():
             self.S = FunctionSpace(NS_obj.mesh, v_cg3)
             self.h = Function(self.S)
             self.h.interpolate(self.__call__)
-            self.forms = [form(inner(self.h[i, :], NS_obj.u_)*dx) for i in range(self.ns)]
+
+        def build_forms(self, u):
+            forms = [form(inner(self.h[i, :], u)*dx) for i in range(self.ns)]
+            return forms
 
         def __call__(self, x):
             values = np.zeros((self.gdim, self.ns, x.shape[1]), dtype=PETSc.ScalarType)
@@ -220,19 +227,35 @@ class NS():
             values = values.reshape((self.ns*self.gdim, -1), order='F')
             return values
 
-        def get_values(self):
-            return np.array([assemble_scalar(form) for form in self.forms])
+        def get_values(self, u):
+            forms = self.build_forms(u)
+            y = np.array([assemble_scalar(form) for form in forms])
+            cost = np.dot(y, y)
+            return y, cost
+
+    def InstSensors(self):
+        return NS.Sensors(self)
+
+    def InstForcing(self):
+        return NS.Forcing(self)
 
     def inlet_velocity(self, x):
         values = np.zeros((self.gdim, x.shape[1]), dtype=PETSc.ScalarType)
         values[0] = 4 * 1.5 * x[1] * (0.41 - x[1])/(0.41**2)
         return values
 
-    def advance(self, dt=None, u_n=None, f=None):
+    def init_cond_generator(self):
+        return self.u_n, self.u_n1
+
+    def advance(self, dt=None, u_n=None, u_n1=None, a=None):
         if dt is not None:
             self.dt = Constant(self.mesh, PETSc.ScalarType(dt))
         if u_n is not None:
             self.u_n = u_n
+        if u_n1 is not None:
+            self.u_n1 = u_n1
+        
+        self.f = self.forcing.get_function(a)
 
         # solve  for one-step the time-dependent problem
         # Step 1: Tentative velocity step
@@ -273,9 +296,10 @@ class NS():
         self.u_.x.scatter_forward()
 
         energy = self.mesh.comm.gather(assemble_scalar(self.r), root=0)
-        y = self.sensors.get_values()
+        y, cost = self.sensors.get_values(self.u_)
+        reward = -cost
 
-        return self.u_, self.p_, energy, y
+        return (self.u_, self.p_), y, reward, energy
 
     def run(self, t=0, T=5.0):
 
@@ -290,9 +314,9 @@ class NS():
             # Update current time step
             t += self.dt.value
             self.forcing.t = t
-            self.f.interpolate(self.forcing)
+            self.f = self.forcing.get_function()
 
-            self.u_, self.p_, energy, y = self.advance()
+            (self.u_, self.p_), y, reward, energy = self.advance()
 
             if self.mesh.comm.rank == 0:
                 energies[i] = sum(energy)
@@ -320,14 +344,14 @@ class NS():
 
 def main():
     ns = NS(
-        dt = 1.0e-2,
-        mu = 0.001,
-        rho = 1,
-        xa = [[0.25, 0.15], [0.25, 0.25], [0.9, 0.2]],
-        xs = [[2.0, 0.2], [1.5, 0.2], [0.9, 0.2]],
-        var = 0.4
+        dt=1.0e-2,
+        mu=0.001,
+        rho=1,
+        xa=[[0.25, 0.15], [0.25, 0.25], [0.9, 0.2]],
+        xs=[[2.0, 0.2], [1.5, 0.2], [0.9, 0.2]],
+        var=0.4
     )
-    ns.run(t = 0, T = 5.0)
+    ns.run(t=0, T=5.0)
 
 
 if __name__ == "__main__":
