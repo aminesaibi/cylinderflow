@@ -21,6 +21,10 @@ class Memory:
         self.buffer[self.ptr] = elmt
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity) 
+    
+    def append_list(self, lst):
+        for elmt in lst:
+            self.append(elmt)
 
     def sample(self, sample_size):
         if sample_size <= self.size :

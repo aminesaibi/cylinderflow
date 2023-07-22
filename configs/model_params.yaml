@@ -1,22 +1,25 @@
-action_noise_scale: 1.0e-2
+action_noise_scale: 1.0e-1
 action_noise_init_val: 1.0e-1
 action_noise_type: "OrnsteinUhlenbeck"
 action_noise_weight_decay: 1.0e-5
 complex_dim: False
-pi_activation : none
+pi_activation : tanh
 value_activation : negrelu
 pi_out_activation : none
 value_out_activation : negrelu
-biased_pi_linear_layers : False
-biased_q_linear_layers : False
+biased_pi_linear_layers : false
+biased_q_linear_layers : false
 pi_weight_init_type : "default"
 q_weight_init_type : "default"
 fc_pi_sizes:
 - 64
 - 128
+- 256
+- 128
 - 3
 fc_q_sizes:
 - 64
+- 128
 - 64
 - 1
 gamma: 0.99

@@ -1,4 +1,10 @@
 import numpy as np
+import os
+import dill
+import sys
+from rl.model import Model
+from utils import load_yaml
+import torch
 import math
 from tqdm import tqdm
 from mpi4py import MPI
@@ -10,18 +16,25 @@ from dolfinx.fem.petsc import (apply_lifting, assemble_matrix, assemble_vector,
 from dolfinx.io import (gmshio, XDMFFile)
 from ufl import (FiniteElement, TestFunction, TrialFunction, VectorElement, TensorElement,
                  div, dot, dx, inner, lhs, grad, nabla_grad, rhs)
+from copy import copy
+import pickle
+import contextlib
+import io
+torch.set_default_dtype(torch.float64)
 
 
 class NS():
     def __init__(self,
+                 comm=MPI.COMM_WORLD,
                  dt=1.0e-2,
                  mu=0.001,
                  rho=1,
                  xa=[0.3, 0.2],
                  xs=[2.0, 0.2],
-                 var=0.4
+                 var=0.4,
+                 controller=None
                  ):
-
+        self.comm = comm
         self.xs = np.array(xs)
         self.ns = self.xs.shape[0]
         self.xa = np.array(xa)
@@ -29,10 +42,15 @@ class NS():
         self.var = var
         self.gdim = 2
         self.mesh, _, self.ft = gmshio.read_from_msh("./environment/mesh.msh",
-                                                     MPI.COMM_WORLD,
+                                                     self.comm,
                                                      rank=0,
                                                      gdim=self.gdim
                                                      )
+        if controller is not None:
+            model_params = load_yaml(controller+'model_params')
+            self.controller = Model(self.ns, self.na, **model_params)
+            self.controller.load_state_dict(torch.load(controller+'state_dict.pt'))
+
         self.ft.name = "Facet markers"
 
         # define our problem specific physical and descritization parameters
@@ -120,6 +138,12 @@ class NS():
         # self.A1.zeroEntries()
         # assemble_matrix(self.A1, self.a1, bcs=self.bcu)
         # self.A1.assemble()
+        # viewer = PETSc.Viewer().createBinary('./ns_cylinder/amat/A.dat', 'w')
+        # viewer(self.A1)
+        # A = copy(self.A1)
+        # A.convert('dense')
+        # A= A.getDenseArray()
+        # np.savetxt(f"./ns_cylinder/amat/{t}", A)
         self.b1 = create_vector(self.L1)
 
         # Next we define the second step
@@ -139,14 +163,14 @@ class NS():
 
         # we use PETSc as a linear algebra backend
         # Solver for step 1
-        self.solver1 = PETSc.KSP().create(self.mesh.comm)
+        self.solver1 = PETSc.KSP().create(self.comm)
         self.solver1.setOperators(self.A1)
         self.solver1.setType(PETSc.KSP.Type.BCGS)
         pc1 = self.solver1.getPC()
         pc1.setType(PETSc.PC.Type.JACOBI)
 
         # Solver for step 2
-        self.solver2 = PETSc.KSP().create(self.mesh.comm)
+        self.solver2 = PETSc.KSP().create(self.comm)
         self.solver2.setOperators(A2)
         self.solver2.setType(PETSc.KSP.Type.MINRES)
         pc2 = self.solver2.getPC()
@@ -154,15 +178,17 @@ class NS():
         pc2.setHYPREType("boomeramg")
 
         # Solver for step 3
-        self.solver3 = PETSc.KSP().create(self.mesh.comm)
+        self.solver3 = PETSc.KSP().create(self.comm)
         self.solver3.setOperators(A3)
         self.solver3.setType(PETSc.KSP.Type.CG)
         pc3 = self.solver3.getPC()
         pc3.setType(PETSc.PC.Type.SOR)
 
         # create output files for the velocity and pressure
-        self.file = XDMFFile(self.mesh.comm, "./ns_cylinder/u_p.xdmf", "w")
-        self.file.write_mesh(self.mesh)
+        # self.file = XDMFFile(self.comm, "./ns_cylinder/u_p.xdmf", "w")
+        # self.file.write_mesh(self.mesh)
+        # if self.comm.rank == 0:
+        #     print('Environment initialized')
 
     @staticmethod
     def rk4(f, x0, dt=0.1):
@@ -254,7 +280,7 @@ class NS():
             self.u_n = u_n
         if u_n1 is not None:
             self.u_n1 = u_n1
-        
+
         self.f = self.forcing.get_function(a)
 
         # solve  for one-step the time-dependent problem
@@ -295,17 +321,57 @@ class NS():
         self.solver3.solve(self.b3, self.u_.vector)
         self.u_.x.scatter_forward()
 
-        energy = self.mesh.comm.gather(assemble_scalar(self.r), root=0)
+        energy = self.comm.gather(assemble_scalar(self.r), root=0)
         y, cost = self.sensors.get_values(self.u_)
         reward = -cost
 
         return (self.u_, self.p_), y, reward, energy
 
-    def run(self, t=0, T=5.0):
+    def run_model(self, args):
+        model, n_rollout, rank = args
+        progress = tqdm(desc="Running environment", total=n_rollout, leave=False, position=2+rank)
+        transitions = [None]*n_rollout
+        with torch.no_grad():
+            x1, _ = self.sensors.get_values(self.u_n1)
+            x1 = torch.tensor(x1).unsqueeze(0)
+
+            for i in range(n_rollout):
+                progress.update(1)
+                a = model.pi(x1)
+                (_, _), x2, r, _ = self.advance(a=a.squeeze(0)
+                                                .detach()
+                                                .numpy()
+                                                )
+                x2 = torch.tensor(x2).unsqueeze(0)
+                r = torch.tensor(r).view(1, 1)
+                transitions[i] = (x1, a, r, x2)
+        return transitions
+
+    def run_with_controller(self, n_rollout):
+        progress = tqdm(desc="Running environment", total=n_rollout, leave=False)
+        transitions = [None]*n_rollout
+        with torch.no_grad():
+            x1, _ = self.sensors.get_values(self.u_n1)
+            x1 = torch.tensor(x1).unsqueeze(0)
+
+            for i in range(n_rollout):
+                progress.update(1)
+                a = self.controller.pi(x1)
+                (_, _), x2, r, _ = self.advance(a=a.squeeze(0)
+                                                .detach()
+                                                .numpy()
+                                                )
+                x2 = torch.tensor(x2).unsqueeze(0)
+                r = torch.tensor(r).view(1, 1)
+                transitions[i] = (x1, a, r, x2)
+        return transitions
+
+    def run(self, t=0, T=5.0, controller=None):
 
         num_steps = int(T/self.dt.value)
         energies = np.zeros(num_steps)
         observations = np.zeros((num_steps, self.sensors.ns))
+        actions = np.zeros((num_steps, self.forcing.na))
 
         progress = tqdm(desc="Solving PDE", total=num_steps)
         for i in range(num_steps):
@@ -313,12 +379,18 @@ class NS():
 
             # Update current time step
             t += self.dt.value
-            self.forcing.t = t
-            self.f = self.forcing.get_function()
+            # self.forcing.t = t
+            if controller is not None:
+                a = controller(torch.tensor(observations[i]))
+                a = a.squeeze(0).detach().numpy()
+            else:
+                a = None
+            self.f = self.forcing.get_function(a)
 
-            (self.u_, self.p_), y, reward, energy = self.advance()
+            (self.u_, self.p_), y, reward, energy = self.advance(t)
 
-            if self.mesh.comm.rank == 0:
+            if self.comm.rank == 0:
+                actions[i] = a
                 energies[i] = sum(energy)
                 observations[i] = y
 
@@ -339,20 +411,38 @@ class NS():
 
         np.savetxt('./ns_cylinder/energies.txt', energies)
         np.savetxt('./ns_cylinder/observations.txt', observations)
+        np.savetxt('./ns_cylinder/actions.txt', actions)
         self.file.close()
 
 
-def main():
-    ns = NS(
-        dt=1.0e-2,
-        mu=0.001,
-        rho=1,
-        xa=[[0.25, 0.15], [0.25, 0.25], [0.9, 0.2]],
-        xs=[[2.0, 0.2], [1.5, 0.2], [0.9, 0.2]],
-        var=0.4
-    )
-    ns.run(t=0, T=5.0)
+# def main(tmp_file):
+#     ns = NS(
+#         dt=1.0e-2,
+#         mu=0.001,
+#         rho=1,
+#         xa=[[0.25, 0.15], [0.25, 0.25], [0.9, 0.2]],
+#         xs=[[2.0, 0.2], [1.5, 0.2], [0.9, 0.2]],
+#         var=0.4,
+#         controller=tmp_file
+#     )
+#     ns.run(t=0, T=5.0)
+
+# # Custom context manager to redirect stdout to a temporary file
+# @contextlib.contextmanager
+# def nostdout():
+#     save_stdout = sys.stdout
+#     sys.stdout = io.BytesIO()
+#     yield
+#     sys.stdout = save_stdout
 
 
 if __name__ == "__main__":
-    main()
+    tmp_file = sys.argv[1]
+    n_rollout = int(sys.argv[2])
+    env_params = load_yaml(tmp_file+'/env_params')
+    ns = NS(**env_params, controller=tmp_file)
+    transitions = ns.run_with_controller(n_rollout)
+    if ns.comm.rank == 0:
+        transitions_ = pickle.dumps(transitions)
+        sys.stdout.buffer.write(transitions_)
+        sys.stdout.flush()

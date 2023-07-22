@@ -14,7 +14,7 @@ class Trainer():
 
     def __init__(self,
                  model,
-                 environment,
+                 environment=None,
                  logger=None,
                  memory_size=20000,
                  params_update_rate=0.01,
@@ -49,6 +49,9 @@ class Trainer():
                                     lr=value_lr, weight_decay=value_reg)
         self.model.to(self.device)
         self.target_model.to(self.device)
+        self.average_cost = 0.0
+        self.best_cost = math.inf
+        print('Trainer initialized.')
 
     def sample_batch(self):
         x1_batch = [None]*self.batch_size
@@ -95,67 +98,75 @@ class Trainer():
 
         return value_loss, policy_loss
 
-    def run(self, verbose=False):
+    # def run_env(self, model=None, memory=None):
+    #     if model is None:
+    #         model = self.model
+    #     if memory is None:
+    #         model = self.memory
 
-        average_reward = 0.0
-        average_cost = 0.0
-        best_cost = math.inf
-        for episode in tqdm(range(self.n_episodes), leave=False, position=self.id):
-            with torch.no_grad():
-                q0, q1 = self.environment.init_cond_generator()
-                x1, _ = self.environment.sensors.get_values(q1)
-                x1 = torch.tensor(x1).unsqueeze(0).to(self.device)
+    #     # average_reward = 0.0
+    #     # average_cost = 0.0
+    #     # best_cost = math.inf
+    #     for episode in tqdm(range(self.n_episodes), leave=False, position=self.id):
+    #         with torch.no_grad():
+    #             q0, q1 = self.environment.init_cond_generator()
+    #             x1, _ = self.environment.sensors.get_values(q1)
+    #             x1 = torch.tensor(x1).unsqueeze(0).to(self.device)
 
-                for t in range(1, self.n_rollout+1):
-                    a = self.model.pi(x1)
-                    (q, _), x2, r, _ = self.environment.advance(u_n=q0,
-                                                                u_n1=q1,
-                                                                a=a.squeeze(0)
-                                                                .detach()
-                                                                .numpy()
-                                                                )
-                    x2 = torch.tensor(x2, device=self.device).unsqueeze(0)
-                    r = torch.tensor(r).view(1, 1)
+    #             for t in range(1, self.n_rollout+1):
+    #                 a = model.pi(x1)
+    #                 (q, _), x2, r, _ = self.environment.advance(u_n=q0,
+    #                                                             u_n1=q1,
+    #                                                             a=a.squeeze(0)
+    #                                                             .detach()
+    #                                                             .numpy()
+    #                                                             )
+    #                 x2 = torch.tensor(x2, device=self.device).unsqueeze(0)
+    #                 r = torch.tensor(r).view(1, 1)
 
-                    self.memory.append((x1, a, r, x2))
-                    average_reward = 1/t*((t-1)*average_reward + float(r))
-                    # average_cost = 1/t*((t-1)*average_cost + float(E))
-                    x1 = x2
-                    q0 = q1
-                    q1 = q
+    #                 self.memory.append((x1, a, r, x2))
+    #                 # average_reward = 1/t*((t-1)*average_reward + float(r))
+    #                 # average_cost = 1/t*((t-1)*average_cost + float(E))
+    #                 x1 = x2
+    #                 q0 = q1
+    #                 q1 = q
 
-            if self.memory.size >= self.batch_size:
-                for _ in range(self.train_steps_per_episode):
-                    value_loss, policy_loss = self.step()
-                    self.logger.add([("Value Loss", value_loss),
-                                     ("Policy Loss", policy_loss),
-                                     ("Average reward", average_reward),
-                                     ("Average cost", average_cost)])
-                if self.logger is not None:
-                    self.logger.log(episode)
+    #             # average_cost = 0.0
+    #             # average_reward = 0.0
+    #     # if self.logger is not None:
+    #     #     if self.logger.proc is not None:
+    #     #         self.logger.stopTensorBoard()
+
+    def train(self, episode):
+        if self.memory.size >= self.batch_size:
+            progress = tqdm(desc="Training", total=self.train_steps_per_episode, leave=False, position=1)
+            for _ in range(self.train_steps_per_episode):
+                value_loss, policy_loss = self.step()
+                self.logger.add([("Value Loss", value_loss),
+                                 ("Policy Loss", policy_loss)
+                                 # ("Average reward", average_reward),
+                                 # ("Average cost", average_cost)
+                                 ])
+                progress.update(1)
+            if self.logger is not None:
+                self.logger.log(episode)
+                torch.save(self.model.state_dict(),
+                           self.logger.directory + "/model_state.pt")
+
+                if self.average_cost < self.best_cost:
+                    self.best_cost = self.average_cost
                     torch.save(self.model.state_dict(),
-                               self.logger.directory + "/model_state.pt")
-
-                    if average_cost < best_cost:
-                        best_cost = average_cost
-                        torch.save(self.model.state_dict(),
-                                   self.logger.directory + "/best_model.pt")
-                if verbose:
-                    print("Episode :{}, average_cost : {:.6f}, average_reward : {:.6f}, \
-                           value_loss : {:.6f}, \
-                           policy_loss : {:.6f}".format(episode,
-                                                        average_cost,
-                                                        average_reward,
-                                                        value_loss,
-                                                        policy_loss
-                                                        )
-                          )
-
-                average_cost = 0.0
-                average_reward = 0.0
-        if self.logger is not None:
-            if self.logger.proc is not None:
-                self.logger.stopTensorBoard()
+                               self.logger.directory + "/best_model.pt")
+            # if verbose:
+            #     print("Episode :{}, average_cost : {:.6f}, average_reward : {:.6f}, \
+            #            value_loss : {:.6f}, \
+            #            policy_loss : {:.6f}".format(episode,
+            #                                         average_cost,
+            #                                         average_reward,
+            #                                         value_loss,
+            #                                         policy_loss
+            #                                         )
+            #           )
 
     @staticmethod
     def soft_update(model, target_model, update_factor=0.1):
